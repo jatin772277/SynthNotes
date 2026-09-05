@@ -1,0 +1,19 @@
+{
+    "base_model": "t5-small",
+    "max_input_length": 512,
+    "max_target_length": 64,
+    "highlight_token": "<hl>",
+    "batch_size_pilot": 1,
+    "learning_rate_pilot": 0.0001,
+    "pilot_train_examples": 1000,
+    "pilot_validation_examples": 100,
+    "pilot_epochs": 1,
+    "pilot_results": {
+        "baseline_bleu": 1.3912,
+        "baseline_rougeL": 0.186,
+        "baseline_meteor": 0.114,
+        "fine_tuned_bleu": 10.7198,
+        "fine_tuned_rougeL": 0.3005,
+        "fine_tuned_meteor": 0.299
+    }
+}
