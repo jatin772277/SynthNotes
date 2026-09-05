@@ -110,7 +110,6 @@ class QAService:
             return ""
 
         answer = str(answer)
-
         answer = answer.strip()
 
         answer = re.sub(
@@ -267,6 +266,7 @@ class QAService:
                     )
 
                     if score > best_score:
+
                         best_score = score
                         best_start = start
                         best_end = end
@@ -315,4 +315,9 @@ class QAService:
         }
 
 
-qa_service = QAService()
+# IMPORTANT:
+# Do NOT create QAService here.
+#
+# It will be created by main.py after FastAPI
+# has already started.
+qa_service = None

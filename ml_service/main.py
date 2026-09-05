@@ -1,11 +1,13 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoTokenizer, TFT5ForConditionalGeneration
+
 import os
 import re
 import sys
+import threading
 
-from ml_service.qa_service import qa_service
+from ml_service import qa_service as qa_module
 
 
 # ============================================================
@@ -40,9 +42,6 @@ MAX_CANDIDATES_PER_CHUNK = 5
 MAX_NEW_TOKENS = 64
 
 # QA validation threshold.
-#
-# We are NOT using this to decide final production quality yet.
-# It is intentionally exposed so we can tune it after testing.
 QA_MATCH_THRESHOLD = 0.60
 
 
@@ -57,25 +56,107 @@ app = FastAPI(
 
 
 # ============================================================
-# LOAD QUESTION GENERATION MODEL
+# ML MODEL STATE
 # ============================================================
 
-print("Loading T5 tokenizer...")
+tokenizer = None
+qg_model = None
+qa_service = None
 
-tokenizer = AutoTokenizer.from_pretrained(
-    QG_TOKENIZER_PATH
-)
-
-print("T5 tokenizer loaded successfully.")
+models_ready = False
+models_loading = False
+models_error = None
 
 
-print("Loading T5 question generation model...")
+# ============================================================
+# LOAD ML MODELS IN BACKGROUND
+# ============================================================
 
-qg_model = TFT5ForConditionalGeneration.from_pretrained(
-    QG_MODEL_PATH
-)
+def load_models():
 
-print("T5 question generation model loaded successfully.")
+    global tokenizer
+    global qg_model
+    global qa_service
+    global models_ready
+    global models_loading
+    global models_error
+
+    try:
+
+        models_loading = True
+
+        # ----------------------------------------------------
+        # T5 tokenizer
+        # ----------------------------------------------------
+
+        print("Loading T5 tokenizer...")
+
+        tokenizer = AutoTokenizer.from_pretrained(
+            QG_TOKENIZER_PATH
+        )
+
+        print("T5 tokenizer loaded successfully.")
+
+        # ----------------------------------------------------
+        # T5 question generation model
+        # ----------------------------------------------------
+
+        print("Loading T5 question generation model...")
+
+        qg_model = TFT5ForConditionalGeneration.from_pretrained(
+            QG_MODEL_PATH
+        )
+
+        print(
+            "T5 question generation model loaded successfully."
+        )
+
+        # ----------------------------------------------------
+        # QA service
+        # ----------------------------------------------------
+
+        print("Loading QA service...")
+
+        qa_service = qa_module.QAService()
+
+        print("QA service loaded successfully.")
+
+        # ----------------------------------------------------
+        # Models ready
+        # ----------------------------------------------------
+
+        models_ready = True
+        models_loading = False
+
+        print("=" * 60)
+        print("ALL ML MODELS READY")
+        print("=" * 60)
+
+    except Exception as error:
+
+        models_loading = False
+        models_error = str(error)
+
+        print("=" * 60)
+        print("ML MODEL LOADING FAILED")
+        print("=" * 60)
+
+        print(error)
+
+
+# ============================================================
+# FASTAPI STARTUP
+# ============================================================
+
+@app.on_event("startup")
+def startup_event():
+
+    thread = threading.Thread(
+        target=load_models,
+        daemon=True
+    )
+
+    thread.start()
 
 
 # ============================================================
@@ -91,6 +172,11 @@ class ProcessRequest(BaseModel):
 # ============================================================
 
 def count_tokens(text):
+
+    if tokenizer is None:
+        raise RuntimeError(
+            "T5 tokenizer is not loaded yet."
+        )
 
     tokens = tokenizer.encode(
         text,
@@ -179,7 +265,7 @@ def create_chunks(text):
             continue
 
         # ----------------------------------------------------
-        # Long paragraph → split by sentences
+        # Long paragraph -> split by sentences
         # ----------------------------------------------------
 
         sentences = split_sentences(
@@ -237,7 +323,6 @@ def create_chunks(text):
                         word_chunk = word
 
                 if word_chunk:
-
                     current_text = word_chunk
 
                 continue
@@ -313,6 +398,12 @@ def generate_question(
     context,
     answer
 ):
+
+    if tokenizer is None or qg_model is None:
+
+        raise RuntimeError(
+            "Question generation model is not ready."
+        )
 
     highlighted_context = highlight_answer(
         context,
@@ -430,7 +521,6 @@ def calculate_answer_match(
     )
 
     if not candidate or not predicted:
-
         return 0.0
 
     # --------------------------------------------------------
@@ -438,7 +528,6 @@ def calculate_answer_match(
     # --------------------------------------------------------
 
     if candidate == predicted:
-
         return 1.0
 
     # --------------------------------------------------------
@@ -470,7 +559,6 @@ def calculate_answer_match(
     )
 
     if not candidate_tokens or not predicted_tokens:
-
         return 0.0
 
     intersection = (
@@ -495,6 +583,16 @@ def validate_generated_item(
     candidate_answer,
     question
 ):
+
+    if qa_service is None:
+
+        return {
+            "validated": False,
+            "validationScore": 0.0,
+            "qaAnswer": "",
+            "qaScore": 0.0,
+            "validationReason": "qa-service-not-ready"
+        }
 
     try:
 
@@ -622,6 +720,30 @@ def process_text(
     request: ProcessRequest
 ):
 
+    # --------------------------------------------------------
+    # Models must be ready before processing
+    # --------------------------------------------------------
+
+    if not models_ready:
+
+        if models_error:
+
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "ML models failed to load: "
+                    + models_error
+                )
+            )
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "ML models are still loading. "
+                "Please try again shortly."
+            )
+        )
+
     text = request.text.strip()
 
     if not text:
@@ -711,6 +833,7 @@ def process_text(
             if duplicate:
 
                 validation["validated"] = False
+
                 validation["validationReason"] = (
                     "duplicate-question"
                 )
@@ -817,11 +940,28 @@ def process_text(
 @app.get("/health")
 def health():
 
+    if models_error:
+
+        return {
+            "success": False,
+            "service": "SynthNotes ML Service",
+            "status": "error",
+            "error": models_error
+        }
+
+    if models_ready:
+
+        return {
+            "success": True,
+            "service": "SynthNotes ML Service",
+            "status": "ready",
+            "tokenizer": "loaded",
+            "questionGenerator": "loaded",
+            "questionAnswering": "loaded"
+        }
+
     return {
         "success": True,
         "service": "SynthNotes ML Service",
-        "status": "running",
-        "tokenizer": "loaded",
-        "questionGenerator": "loaded",
-        "questionAnswering": "loaded"
+        "status": "loading"
     }
