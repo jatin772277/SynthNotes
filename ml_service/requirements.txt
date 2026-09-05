@@ -2,4 +2,6 @@ fastapi
 uvicorn[standard]
 transformers==4.49.0
 torch
+tensorflow==2.21.0
+tf-keras==2.21.0
 sentencepiece
