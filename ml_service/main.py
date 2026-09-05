@@ -1,13 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from transformers import AutoTokenizer, TFT5ForConditionalGeneration
-
 import os
 import re
 import sys
 import threading
-
-from ml_service import qa_service as qa_module
 
 
 # ============================================================
@@ -42,6 +38,9 @@ MAX_CANDIDATES_PER_CHUNK = 5
 MAX_NEW_TOKENS = 64
 
 # QA validation threshold.
+#
+# We are NOT using this to decide final production quality yet.
+# It is intentionally exposed so we can tune it after testing.
 QA_MATCH_THRESHOLD = 0.60
 
 
@@ -56,7 +55,11 @@ app = FastAPI(
 
 
 # ============================================================
-# ML MODEL STATE
+# MODEL STATE
+# ============================================================
+# IMPORTANT: Do not load TensorFlow / QA service or the large
+# models during module import. Render must be able to start
+# Uvicorn and bind 0.0.0.0:$PORT first.
 # ============================================================
 
 tokenizer = None
@@ -68,12 +71,7 @@ models_loading = False
 models_error = None
 
 
-# ============================================================
-# LOAD ML MODELS IN BACKGROUND
-# ============================================================
-
 def load_models():
-
     global tokenizer
     global qg_model
     global qa_service
@@ -81,81 +79,63 @@ def load_models():
     global models_loading
     global models_error
 
+    if models_loading or models_ready:
+        return
+
+    models_loading = True
+    models_error = None
+
     try:
-
-        models_loading = True
-
-        # ----------------------------------------------------
-        # T5 tokenizer
-        # ----------------------------------------------------
-
-        print("Loading T5 tokenizer...")
+        print("Loading T5 tokenizer...", flush=True)
+        from transformers import AutoTokenizer, TFT5ForConditionalGeneration
 
         tokenizer = AutoTokenizer.from_pretrained(
             QG_TOKENIZER_PATH
         )
+        print("T5 tokenizer loaded successfully.", flush=True)
 
-        print("T5 tokenizer loaded successfully.")
-
-        # ----------------------------------------------------
-        # T5 question generation model
-        # ----------------------------------------------------
-
-        print("Loading T5 question generation model...")
-
+        print("Loading T5 question generation model...", flush=True)
         qg_model = TFT5ForConditionalGeneration.from_pretrained(
             QG_MODEL_PATH
         )
+        print("T5 question generation model loaded successfully.", flush=True)
 
-        print(
-            "T5 question generation model loaded successfully."
-        )
+        # Lazy import: TensorFlow and the QA model are intentionally
+        # imported only after Uvicorn has already started.
+        print("Loading QA service...", flush=True)
+        from ml_service.qa_service import QAService
 
-        # ----------------------------------------------------
-        # QA service
-        # ----------------------------------------------------
-
-        print("Loading QA service...")
-
-        qa_service = qa_module.QAService()
-
-        print("QA service loaded successfully.")
-
-        # ----------------------------------------------------
-        # Models ready
-        # ----------------------------------------------------
+        qa_service = QAService()
+        print("QA service loaded successfully.", flush=True)
 
         models_ready = True
-        models_loading = False
 
-        print("=" * 60)
-        print("ALL ML MODELS READY")
-        print("=" * 60)
+        print("=" * 60, flush=True)
+        print("ALL ML MODELS READY", flush=True)
+        print("=" * 60, flush=True)
 
     except Exception as error:
-
-        models_loading = False
         models_error = str(error)
+        models_ready = False
 
-        print("=" * 60)
-        print("ML MODEL LOADING FAILED")
-        print("=" * 60)
+        print("=" * 60, flush=True)
+        print("MODEL LOADING FAILED", flush=True)
+        print(models_error, flush=True)
+        print("=" * 60, flush=True)
 
-        print(error)
+    finally:
+        models_loading = False
 
-
-# ============================================================
-# FASTAPI STARTUP
-# ============================================================
 
 @app.on_event("startup")
 def startup_event():
+    print("FastAPI startup complete. Starting model loading in background...", flush=True)
 
     thread = threading.Thread(
         target=load_models,
-        daemon=True
+        daemon=True,
+        name="model-loader"
     )
-
     thread.start()
 
 
@@ -174,9 +154,7 @@ class ProcessRequest(BaseModel):
 def count_tokens(text):
 
     if tokenizer is None:
-        raise RuntimeError(
-            "T5 tokenizer is not loaded yet."
-        )
+        raise RuntimeError("T5 tokenizer is not ready yet.")
 
     tokens = tokenizer.encode(
         text,
@@ -265,7 +243,7 @@ def create_chunks(text):
             continue
 
         # ----------------------------------------------------
-        # Long paragraph -> split by sentences
+        # Long paragraph → split by sentences
         # ----------------------------------------------------
 
         sentences = split_sentences(
@@ -323,6 +301,7 @@ def create_chunks(text):
                         word_chunk = word
 
                 if word_chunk:
+
                     current_text = word_chunk
 
                 continue
@@ -400,10 +379,7 @@ def generate_question(
 ):
 
     if tokenizer is None or qg_model is None:
-
-        raise RuntimeError(
-            "Question generation model is not ready."
-        )
+        raise RuntimeError("Question generation model is not ready yet.")
 
     highlighted_context = highlight_answer(
         context,
@@ -521,6 +497,7 @@ def calculate_answer_match(
     )
 
     if not candidate or not predicted:
+
         return 0.0
 
     # --------------------------------------------------------
@@ -528,6 +505,7 @@ def calculate_answer_match(
     # --------------------------------------------------------
 
     if candidate == predicted:
+
         return 1.0
 
     # --------------------------------------------------------
@@ -559,6 +537,7 @@ def calculate_answer_match(
     )
 
     if not candidate_tokens or not predicted_tokens:
+
         return 0.0
 
     intersection = (
@@ -585,7 +564,6 @@ def validate_generated_item(
 ):
 
     if qa_service is None:
-
         return {
             "validated": False,
             "validationScore": 0.0,
@@ -720,28 +698,16 @@ def process_text(
     request: ProcessRequest
 ):
 
-    # --------------------------------------------------------
-    # Models must be ready before processing
-    # --------------------------------------------------------
-
     if not models_ready:
-
         if models_error:
-
             raise HTTPException(
                 status_code=500,
-                detail=(
-                    "ML models failed to load: "
-                    + models_error
-                )
+                detail="ML models failed to load: " + models_error
             )
 
         raise HTTPException(
             status_code=503,
-            detail=(
-                "ML models are still loading. "
-                "Please try again shortly."
-            )
+            detail="ML models are still loading. Please try again shortly."
         )
 
     text = request.text.strip()
@@ -833,7 +799,6 @@ def process_text(
             if duplicate:
 
                 validation["validated"] = False
-
                 validation["validationReason"] = (
                     "duplicate-question"
                 )
@@ -939,29 +904,32 @@ def process_text(
 
 @app.get("/health")
 def health():
-
     if models_error:
-
         return {
             "success": False,
             "service": "SynthNotes ML Service",
             "status": "error",
+            "tokenizer": tokenizer is not None,
+            "questionGenerator": qg_model is not None,
+            "questionAnswering": qa_service is not None,
             "error": models_error
         }
 
-    if models_ready:
-
+    if not models_ready:
         return {
             "success": True,
             "service": "SynthNotes ML Service",
-            "status": "ready",
-            "tokenizer": "loaded",
-            "questionGenerator": "loaded",
-            "questionAnswering": "loaded"
+            "status": "loading",
+            "tokenizer": tokenizer is not None,
+            "questionGenerator": qg_model is not None,
+            "questionAnswering": qa_service is not None
         }
 
     return {
         "success": True,
         "service": "SynthNotes ML Service",
-        "status": "loading"
+        "status": "ready",
+        "tokenizer": True,
+        "questionGenerator": True,
+        "questionAnswering": True
     }
